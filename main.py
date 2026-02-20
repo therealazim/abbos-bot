@@ -2,17 +2,18 @@ import telebot
 import sqlite3
 import os
 import random
+import pandas as pd
 from telebot import types
 
-# Render'dagi Environment Variables'dan olinadi
+# Render'da Environment Variables qismiga BOT_TOKEN ni qo'shing
 TOKEN = os.getenv('BOT_TOKEN', '8549416953:AAFtVScYoBHoegqdzeOh5IwrD7LhoK0ftqs')
 bot = telebot.TeleBot(TOKEN)
 
-# Foydalanuvchi qadamlarini vaqtinchalik xotirada saqlash
+# Foydalanuvchi qadamlarini vaqtinchalik saqlash
 user_data = {}
 
 def init_db():
-    conn = sqlite3.connect('rush_v3.db', check_same_thread=False)
+    conn = sqlite3.connect('rush_final.db', check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute('CREATE TABLE IF NOT EXISTS tests (test_id INTEGER PRIMARY KEY, keys TEXT)')
     cursor.execute('''CREATE TABLE IF NOT EXISTS results 
@@ -21,7 +22,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-# Inline Tugmalar generatori
 def get_keyboard(q_num, mode, test_id="0"):
     markup = types.InlineKeyboardMarkup(row_width=4)
     row = [types.InlineKeyboardButton(ch, callback_data=f"{mode}_{q_num}_{ch.lower()}_{test_id}") for ch in ['A', 'B', 'C', 'D']]
@@ -31,7 +31,8 @@ def get_keyboard(q_num, mode, test_id="0"):
 @bot.message_handler(commands=['start'])
 def welcome(message):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add("🆕 Test Tuzish", "✍️ Test Ishlash", "🏆 Reyting")
+    markup.add("🆕 Test Tuzish", "✍️ Test Ishlash")
+    markup.add("🏆 Reyting", "📊 Excel Yuklash")
     bot.send_message(message.chat.id, "👋 Rush Module interaktiv botiga xush kelibsiz!", reply_markup=markup)
 
 # --- TEST TUZISH ---
@@ -50,7 +51,7 @@ def input_id(message):
 
 def verify_test_id(message):
     t_id = message.text.strip()
-    conn = sqlite3.connect('rush_v3.db')
+    conn = sqlite3.connect('rush_final.db')
     cursor = conn.cursor()
     cursor.execute("SELECT keys FROM tests WHERE test_id = ?", (t_id,))
     res = cursor.fetchone()
@@ -69,7 +70,7 @@ def start_solving(message, t_id, correct_keys):
     bot.send_message(message.chat.id, f"📝 Test ID: {t_id}\n**1-savol** javobini tanlang:", 
                      reply_markup=get_keyboard(1, "solve", t_id), parse_mode="Markdown")
 
-# --- TUGMALARNI QABUL QILISH ---
+# --- CALLBACK QUERY ---
 @bot.callback_query_handler(func=lambda call: True)
 def handle_clicks(call):
     data = call.data.split('_')
@@ -87,7 +88,7 @@ def handle_clicks(call):
                                  reply_markup=get_keyboard(next_q, "set"), parse_mode="Markdown")
         else:
             new_id = random.randint(1000, 9999)
-            conn = sqlite3.connect('rush_v3.db')
+            conn = sqlite3.connect('rush_final.db')
             cursor = conn.cursor()
             cursor.execute("INSERT INTO tests VALUES (?, ?)", (new_id, user_data[uid]['keys']))
             conn.commit()
@@ -111,7 +112,7 @@ def finish_test(call):
     correct = sum(1 for i in range(45) if d['ans'][i] == d['keys'][i])
     perc = round((correct/45)*100, 1)
 
-    conn = sqlite3.connect('rush_v3.db')
+    conn = sqlite3.connect('rush_final.db')
     cursor = conn.cursor()
     cursor.execute("INSERT OR REPLACE INTO results VALUES (?, ?, ?, ?, ?)", (uid, d['tid'], d['name'], correct, perc))
     conn.commit()
@@ -123,27 +124,37 @@ def finish_test(call):
                          call.message.chat.id, call.message.message_id, parse_mode="Markdown")
     del user_data[uid]
 
-@bot.message_handler(func=lambda m: m.text == "🏆 Reyting")
-def ask_id_rating(message):
-    msg = bot.send_message(message.chat.id, "📊 Reytingni ko'rish uchun Test ID raqamini yuboring:")
-    bot.register_next_step_handler(msg, show_leaderboard)
+# --- REYTING VA EXCEL ---
+@bot.message_handler(func=lambda m: m.text in ["🏆 Reyting", "📊 Excel Yuklash"])
+def ask_id_for_extra(message):
+    action = "rating" if message.text == "🏆 Reyting" else "excel"
+    msg = bot.send_message(message.chat.id, f"🔢 Test ID raqamini yuboring ({action}):")
+    bot.register_next_step_handler(msg, process_extra, action)
 
-def show_leaderboard(message):
+def process_extra(message, action):
     t_id = message.text.strip()
-    conn = sqlite3.connect('rush_v3.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT name, correct, score FROM results WHERE test_id = ? ORDER BY score DESC LIMIT 15", (t_id,))
-    rows = cursor.fetchall()
+    conn = sqlite3.connect('rush_final.db')
+    if action == "rating":
+        cursor = conn.cursor()
+        cursor.execute("SELECT name, correct, score FROM results WHERE test_id = ? ORDER BY score DESC LIMIT 15", (t_id,))
+        rows = cursor.fetchall()
+        if not rows:
+            bot.send_message(message.chat.id, "📭 Natijalar topilmadi.")
+        else:
+            res = f"🏆 **Test {t_id} bo'yicha TOP-15:**\n\n"
+            for i, r in enumerate(rows, 1):
+                res += f"{i}. {r[0]} — {r[1]} ta ({r[2]}%)\n"
+            bot.send_message(message.chat.id, res, parse_mode="Markdown")
+    else:
+        df = pd.read_sql_query(f"SELECT name as 'F.I.SH', correct as 'To''g'ri', score as 'Ball' FROM results WHERE test_id = {t_id} ORDER BY score DESC", conn)
+        if df.empty:
+            bot.send_message(message.chat.id, "📭 Natijalar mavjud emas.")
+        else:
+            path = f"results_{t_id}.xlsx"
+            df.to_excel(path, index=False)
+            with open(path, 'rb') as f:
+                bot.send_document(message.chat.id, f, caption=f"📊 Test {t_id} natijalari")
     conn.close()
-
-    if not rows:
-        bot.send_message(message.chat.id, "📭 Bu test bo'yicha natijalar yo'q.")
-        return
-
-    res = f"🏆 **Test {t_id} bo'yicha TOP-15:**\n\n"
-    for i, r in enumerate(rows, 1):
-        res += f"{i}. {r[0]} — {r[1]} ta ({r[2]}%)\n"
-    bot.send_message(message.chat.id, res, parse_mode="Markdown")
 
 if __name__ == '__main__':
     init_db()
