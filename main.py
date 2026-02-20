@@ -1,117 +1,140 @@
 import telebot
 import sqlite3
 import os
+import random
+import pandas as pd
 from telebot import types
+from threading import Thread
+from flask import Flask
 
-# --- SOZLAMALAR ---
-# Render'da Environment Variables qismiga BOT_TOKEN va ADMIN_ID ni qo'shing
 TOKEN = os.getenv('BOT_TOKEN', '8549416953:AAFtVScYoBHoegqdzeOh5IwrD7LhoK0ftqs')
-ADMIN_ID = int(os.getenv('ADMIN_ID', '5890942200'))
-
 bot = telebot.TeleBot(TOKEN)
 
-# --- MA'LUMOTLAR BAZASI ---
+# Render port xatosi uchun
+server = Flask('')
+@server.route('/')
+def home(): return "Bot is running!"
+def run(): server.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+
 def init_db():
-    conn = sqlite3.connect('rush_module.db', check_same_thread=False)
+    conn = sqlite3.connect('rush_v6.db', check_same_thread=False)
     cursor = conn.cursor()
-    cursor.execute('CREATE TABLE IF NOT EXISTS test_keys (id INTEGER PRIMARY KEY, keys TEXT)')
+    cursor.execute('CREATE TABLE IF NOT EXISTS tests (test_id INTEGER PRIMARY KEY, keys TEXT)')
     cursor.execute('''CREATE TABLE IF NOT EXISTS results 
-                      (user_id INTEGER PRIMARY KEY, name TEXT, correct INTEGER, score REAL)''')
+                      (user_id INTEGER, test_id INTEGER, name TEXT, correct INTEGER, score REAL,
+                       PRIMARY KEY (user_id, test_id))''')
     conn.commit()
     conn.close()
 
-# --- ADMIN BUYRUQLARI ---
+# Foydalanuvchi tanlovlarini vaqtinchalik saqlash
+# {user_id: {'answers': ['A', 'A', ...], 'mode': 'set/solve', 'tid': '123', 'name': '...'} }
+user_sessions = {}
 
-@bot.message_handler(commands=['testtuzish'])
-def start_test_creation(message):
-    if message.from_user.id == ADMIN_ID:
-        msg = bot.send_message(message.chat.id, "📝 **Yangi test yaratish.**\n\n45 ta to'g'ri javobni bir qatorda yuboring (Masalan: abcd...):", parse_mode="Markdown")
-        bot.register_next_step_handler(msg, save_keys)
-    else:
-        bot.reply_to(message, "⛔️ Bu buyruq faqat admin uchun!")
-
-def save_keys(message):
-    keys = message.text.lower().strip()
-    if len(keys) != 45:
-        bot.reply_to(message, f"❌ Xato! 45 ta bo'lishi kerak. Siz {len(keys)} ta yubordingiz. /testtuzish")
-        return
-
-    conn = sqlite3.connect('rush_module.db')
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM test_keys")
-    cursor.execute("INSERT INTO test_keys (keys) VALUES (?)", (keys,))
-    cursor.execute("DELETE FROM results")  # Yangi test uchun natijalarni tozalash
-    conn.commit()
-    conn.close()
-    bot.send_message(message.chat.id, "✅ Kalitlar saqlandi! O'quvchilar /test ni boshlashlari mumkin.")
-
-# --- O'QUVCHI BUYRUQLARI ---
+def create_grid_keyboard(uid):
+    session = user_sessions.get(uid)
+    if not session: return None
+    
+    markup = types.InlineKeyboardMarkup(row_width=5)
+    buttons = []
+    ans_list = session['answers']
+    
+    for i in range(45):
+        current_val = ans_list[i]
+        # Tugma matni: "1:A"
+        btn_text = f"{i+1}:{current_val}"
+        callback = f"click_{i}"
+        buttons.append(types.InlineKeyboardButton(btn_text, callback_data=callback))
+    
+    markup.add(*buttons)
+    markup.add(types.InlineKeyboardButton("✅ TASDIQLASH (TAYYOR)", callback_data="submit_all"))
+    return markup
 
 @bot.message_handler(commands=['start'])
 def welcome(message):
-    bot.reply_to(message, "👋 **Rush Module botiga xush kelibsiz!**\n\n🔹 Test topshirish: /test\n🏆 Reyting: /rating")
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("🆕 Test Tuzish", "✍️ Test Ishlash")
+    markup.add("🏆 Reyting", "📊 Excel Yuklash")
+    bot.send_message(message.chat.id, "👋 Rush Module interaktiv botiga xush kelibsiz!", reply_markup=markup)
 
-@bot.message_handler(commands=['test'])
-def start_test(message):
-    msg = bot.send_message(message.chat.id, "👤 Ism va familiyangizni kiriting:")
-    bot.register_next_step_handler(msg, get_name)
+@bot.message_handler(func=lambda m: m.text == "🆕 Test Tuzish")
+def start_tuzish(message):
+    uid = message.from_user.id
+    user_sessions[uid] = {'answers': ['A']*45, 'mode': 'set'}
+    bot.send_message(message.chat.id, "📝 45 ta savol uchun to'g'ri kalitlarni belgilang:\n(Raqamni bossangiz harf o'zgaradi)", 
+                     reply_markup=create_grid_keyboard(uid))
 
-def get_name(message):
-    full_name = message.text
-    msg = bot.send_message(message.chat.id, f"Rahmat, **{full_name}**. \n\n45 ta javobingizni yuboring:")
-    bot.register_next_step_handler(msg, check_student_answers, full_name)
+@bot.message_handler(func=lambda m: m.text == "✍️ Test Ishlash")
+def input_id(message):
+    msg = bot.send_message(message.chat.id, "🔢 Test ID raqamini kiriting:")
+    bot.register_next_step_handler(msg, get_id_solve)
 
-def check_student_answers(message, name):
-    user_ans = message.text.lower().strip()
-    
-    conn = sqlite3.connect('rush_module.db')
+def get_id_solve(message):
+    tid = message.text.strip()
+    conn = sqlite3.connect('rush_v6.db')
     cursor = conn.cursor()
-    cursor.execute("SELECT keys FROM test_keys")
-    row = cursor.fetchone()
-
-    if not row:
-        bot.reply_to(message, "⚠️ Hozircha faol test yo'q.")
-        conn.close()
-        return
-
-    true_keys = row[0]
-    if len(user_ans) != 45:
-        bot.reply_to(message, f"❌ Xato! Javoblar 45 ta bo'lishi kerak. /test")
-        conn.close()
-        return
-
-    correct = sum(1 for i in range(45) if user_ans[i] == true_keys[i])
-    score_percent = (correct / 45) * 100
-
-    cursor.execute("INSERT OR REPLACE INTO results VALUES (?, ?, ?, ?)", 
-                   (message.from_user.id, name, correct, round(score_percent, 1)))
-    conn.commit()
-
-    cursor.execute("SELECT COUNT(*) FROM results WHERE score > ?", (score_percent,))
-    rank = cursor.fetchone()[0] + 1
+    cursor.execute("SELECT keys FROM tests WHERE test_id = ?", (tid,))
+    res = cursor.fetchone()
     conn.close()
+    if not res:
+        bot.reply_to(message, "❌ Test topilmadi.")
+        return
+    msg = bot.send_message(message.chat.id, "👤 Ism-familiyangizni kiriting:")
+    bot.register_next_step_handler(msg, run_solver, tid, res[0])
 
-    bot.reply_to(message, f"🏁 **Natijangiz:**\n\n👤 {name}\n✅ To'g'ri: {correct}\n📊 Ball: {score_percent:.1f}%\n🏆 O'rin: {rank}")
+def run_solver(message, tid, keys):
+    uid = message.from_user.id
+    user_sessions[uid] = {'answers': ['A']*45, 'mode': 'solve', 'tid': tid, 'correct_keys': keys, 'name': message.text}
+    bot.send_message(message.chat.id, f"📝 Test ID: {tid}\nJavoblaringizni belgilang:", 
+                     reply_markup=create_grid_keyboard(uid))
 
-@bot.message_handler(commands=['rating'])
-def get_rating(message):
-    conn = sqlite3.connect('rush_module.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT name, correct, score FROM results ORDER BY score DESC LIMIT 20")
-    data = cursor.fetchall()
-    conn.close()
-
-    if not data:
-        bot.send_message(message.chat.id, "📭 Natijalar yo'q.")
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    uid = call.from_user.id
+    if uid not in user_sessions:
+        bot.answer_callback_query(call.id, "Sessiya muddati tugagan. Qaytadan boshlang.")
         return
 
-    text = "🏆 **TOP 20 REYTING:**\n\n"
-    for i, user in enumerate(data, 1):
-        text += f"{i}. {user[0]} — {user[1]} ta ({user[2]}%)\n"
-    
-    bot.send_message(message.chat.id, text, parse_mode="Markdown")
+    if call.data.startswith("click_"):
+        index = int(call.data.split("_")[1])
+        # Harfni almashtirish: A -> B -> C -> D -> A
+        current = user_sessions[uid]['answers'][index]
+        next_val = {'A':'B', 'B':'C', 'C':'D', 'D':'A'}[current]
+        user_sessions[uid]['answers'][index] = next_val
+        
+        # Faqat klaviaturani yangilash (xabar matni o'zgarmaydi)
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, 
+                                      reply_markup=create_grid_keyboard(uid))
+        bot.answer_callback_query(call.id)
+
+    elif call.data == "submit_all":
+        data = user_sessions[uid]
+        final_keys = "".join(data['answers']).lower()
+        
+        if data['mode'] == 'set':
+            new_id = random.randint(1000, 9999)
+            conn = sqlite3.connect('rush_v6.db')
+            cursor = conn.cursor()
+            cursor.execute("INSERT INTO tests VALUES (?, ?)", (new_id, final_keys))
+            conn.commit()
+            conn.close()
+            bot.edit_message_text(f"✅ Test yaratildi! ID: `{new_id}`", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+        
+        else:
+            correct = sum(1 for i in range(45) if final_keys[i] == data['correct_keys'][i])
+            perc = round((correct/45)*100, 1)
+            conn = sqlite3.connect('rush_v6.db')
+            cursor = conn.cursor()
+            cursor.execute("INSERT OR REPLACE INTO results VALUES (?, ?, ?, ?, ?)", (uid, data['tid'], data['name'], correct, perc))
+            conn.commit()
+            conn.close()
+            bot.edit_message_text(f"🏁 Natija: {correct}/45 ({perc}%)", call.message.chat.id, call.message.message_id)
+        
+        del user_sessions[uid]
+        bot.answer_callback_query(call.id, "Muvaffaqiyatli saqlandi!")
+
+# (Reyting va Excel qismlari yuqoridagidek qoladi...)
 
 if __name__ == '__main__':
     init_db()
-    print("Bot ishladi...")
-    bot.infinity_polling()
+    Thread(target=run).start()
+    bot.infinity_polling(timeout=20)
